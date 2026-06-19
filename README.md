@@ -31,6 +31,13 @@ AZURE_AI_PROJECT_ENDPOINT=<your-foundry-project-endpoint>
 AZURE_AI_MODEL_DEPLOYMENT_NAME=<your-model-deployment-name>
 ```
 
+> **How these reach the running container.** The hosted runtime does **not**
+> read your `.env` file. `agent.yaml` declares an `environment_variables:` block
+> whose `${...}` references point at the two keys above. At deploy time the
+> Foundry extension resolves them **from your local `.env`** and bakes the
+> resolved values into the new agent version. Keep the variable **names** in
+> `.env` exactly as shown so the `${...}` references resolve.
+
 ## Deploy
 
 1. Open this folder in VS Code.
@@ -41,6 +48,10 @@ AZURE_AI_MODEL_DEPLOYMENT_NAME=<your-model-deployment-name>
 The extension builds the image in Azure Container Registry, pushes it, and
 creates the hosted agent. With the slimmed dependencies (see below) the ACR
 build completes well within the extension's build-polling window.
+
+> **Env vars are immutable per version.** If you change a value in `.env`, you
+> must **redeploy** — each deployment creates a new immutable agent version with
+> the resolved environment variables baked in.
 
 ### Grant the agent permission to call the model
 
@@ -62,6 +73,7 @@ Root cause and fixes:
 
 | Problem | Fix |
 | --- | --- |
+| **The container started with no configuration and crashed at startup** (`ValueError: AZURE_AI_PROJECT_ENDPOINT environment variable is required`), so readiness never returned 200 and the agent showed `session_not_ready`. The deploy log said *"No environment variables found in agent.yaml"*. The hosted runtime does **not** read the local `.env` — env vars must be declared in `agent.yaml`. | Added an `environment_variables:` block to `agent.yaml` that injects `AZURE_AI_PROJECT_ENDPOINT` and `AZURE_AI_MODEL_DEPLOYMENT_NAME` into the container (resolved from your `.env` at deploy time). |
 | `requirements.txt` pinned the umbrella **`agent-framework==1.0.0rc3`**, which resolves to `agent-framework-core[all]` and installs **every** optional integration (a2a, copilotstudio, devui, redis, mem0, anthropic, ollama, …). The huge install made the ACR build run for minutes and time out. | Depend only on `agent-framework-core`, `agent-framework-azure-ai`, the agent-server adapter, and the observability package — all pinned so pip resolves with no backtracking. |
 | The whole repo (`.git`, `images/`, `.devcontainer/`, `.foundry/`, …) was uploaded and `COPY`-ed into the image, bloating the build context. | Added a `.dockerignore` so only the app is uploaded/copied. |
 | `main` returned **before starting the server** when Application Insights was not connected, so the container exited and the agent never appeared in Foundry. | Observability is now **best-effort**; the agent server always starts. |
@@ -86,4 +98,4 @@ python main.py   # serves the agent on http://localhost:8088
 | `requirements.txt` | Minimal, pinned dependency set (the key deployment fix). |
 | `Dockerfile` | Small, deterministic image; listens on `:8088`. |
 | `.dockerignore` | Keeps the build context / ACR upload small. |
-| `agent.yaml` | Hosted-agent name and compute (CPU/memory). |
+| `agent.yaml` | Hosted-agent name, protocol, compute (CPU/memory), and the `environment_variables:` block that feeds config into the container. |

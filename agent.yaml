@@ -1,5 +1,35 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
+
+kind: hosted
 name: sequential-orchestration-hostedagents-example
+description: >
+  Sequential multi-agent orchestration (Researcher -> Writer -> Reviewer) built
+  with the Microsoft Agent Framework and served as a Microsoft Foundry Hosted Agent.
+
+# The Responses protocol is what the Foundry Hosted Agent runtime (and the
+# agent server adapter that main.py uses) speaks on port 8088.
+protocols:
+  - protocol: responses
+    version: v1
+
+# CRITICAL: these are the values passed to the CONTAINER at runtime.
+#
+# The hosted runtime does NOT read your local `.env` file. Env vars must be
+# declared here. The AI Toolkit / Foundry extension resolves each `${VAR}`
+# reference below from the `.env` you keep next to this file at deploy time and
+# bakes the resolved values into the new (immutable) agent version.
+#
+# The names on the left (`name:`) are the variable names the container will see
+# (what main.py reads with os.environ). The `${...}` on the right MUST match the
+# keys in your local `.env`.
+environment_variables:
+  - name: AZURE_AI_PROJECT_ENDPOINT
+    value: ${AZURE_AI_PROJECT_ENDPOINT}
+  - name: AZURE_AI_MODEL_DEPLOYMENT_NAME
+    value: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}
+
 dockerfile_path: Dockerfile
+
 resources:
   cpu: '1.0'
   memory: 2.0Gi
