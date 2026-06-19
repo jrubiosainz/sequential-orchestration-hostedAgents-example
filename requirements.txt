@@ -1,0 +1,25 @@
+# --- Foundry Hosted Agent runtime ---
+# Server adapter that wraps an Agent Framework agent/workflow and exposes the
+# Responses protocol on port 8088 (what Foundry Hosted Agents expect).
+azure-ai-agentserver-agentframework==1.0.0b17
+
+# Pin the Agent Framework packages EXPLICITLY to the minimal set this app needs.
+#
+# IMPORTANT: do NOT depend on the umbrella `agent-framework` package. It resolves
+# to `agent-framework-core[all]`, which drags in EVERY optional integration
+# (a2a, ag-ui, copilotstudio, declarative, devui, redis, mem0, anthropic,
+# ollama, purview, ...). Installing all of that is what made the Azure Container
+# Registry build run for several minutes and time out during deployment
+# ("Build status polling timed out after 15 attempts").
+#
+# These two packages already satisfy the constraints declared by
+# azure-ai-agentserver-agentframework (core/azure-ai in the rc2..rc3 range) and
+# pull in azure-ai-projects, azure-identity, openai and the opentelemetry stack
+# transitively, so the install stays small and resolves with no backtracking.
+agent-framework-core==1.0.0rc3
+agent-framework-azure-ai==1.0.0rc3
+
+# --- Observability (optional, best-effort) ---
+# opentelemetry-sdk==1.39 pinned here is compatible with agent-framework-core's
+# opentelemetry-sdk>=1.39.0 requirement, so pip resolves cleanly.
+azure-monitor-opentelemetry==1.8.4

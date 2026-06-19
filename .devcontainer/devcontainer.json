@@ -1,0 +1,28 @@
+{
+    "name": "Python Development Container",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "version": "latest",
+            "enableNonRootDocker": "true",
+            "moby": "true"
+        },
+        "ghcr.io/devcontainers/features/azure-cli:1": {
+            "version": "latest"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "GitHub.copilot",
+                "GitHub.copilot-chat",
+                "ms-vscode.azurecli",
+                "TeamsDevApp.vscode-ai-foundry"
+            ]
+        }
+    },
+    "postCreateCommand": "python --version && docker --version && az --version",
+    "remoteUser": "vscode"
+}
