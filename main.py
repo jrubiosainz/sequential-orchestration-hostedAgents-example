@@ -2,8 +2,18 @@
 
 import asyncio
 import os
+from typing import Never
 
-from agent_framework import Agent, WorkflowBuilder
+from agent_framework import (
+    Agent,
+    AgentResponse,
+    AgentResponseUpdate,
+    Executor,
+    Message,
+    WorkflowBuilder,
+    WorkflowContext,
+    handler,
+)
 from agent_framework.azure import AzureOpenAIResponsesClient
 from azure.ai.projects.aio import AIProjectClient
 from azure.identity.aio import DefaultAzureCredential
@@ -17,24 +27,35 @@ Sample: Sequential workflow hosted on Microsoft Foundry as a Hosted Agent.
 
 Sequential Workflow: Researcher -> Writer -> Reviewer
 
-This workflow orchestrates three agents in sequence:
-1. Researcher: gathers the key facts and angles for the user's topic.
-2. Writer: turns the research into a well-structured draft.
-3. Reviewer: polishes the draft and returns the final piece.
+This workflow orchestrates three steps in sequence, each implemented as its own
+``Executor``:
+1. Researcher: processes the initial user message.
+2. Writer: takes the researcher's output and generates content.
+3. Reviewer: reviews and finalizes the content.
 
-The agents are wired *directly* into the WorkflowBuilder. The framework
-auto-wraps each agent in a streaming ``AgentExecutor`` that emits incremental
-``AgentRunUpdateEvent`` updates while the model is still generating. Those
-updates are forwarded by ``from_agent_framework(...)`` as Server-Sent-Event
-deltas, which keeps the Foundry Playground connection alive during long runs.
+NOTE ON "WHERE THE AGENTS LIVE"
+-------------------------------
+The Researcher / Writer / Reviewer ``Agent`` objects below are **local,
+in-memory** objects. They are NOT created, registered, or modified in your
+Foundry project's *Agents* list. Each one simply calls your **model
+deployment** (via ``AzureOpenAIResponsesClient``). The only thing that appears
+in Foundry is the *hosted agent* container that wraps this whole workflow.
+(If you instead want to invoke agents you have already defined in the Foundry
+portal, that needs a different client -- ``AzureAIAgentClient`` referencing each
+agent by id -- which is not what this sample does.)
 
-(The earlier version used custom ``Executor`` subclasses that called the
-blocking ``agent.run(...)`` and only yielded once at the very end. That
-produced no streamed bytes until the whole workflow finished, so the
-Playground's streaming client timed out with a "network error".)
+STREAMING (why each Executor streams)
+-------------------------------------
+Each handler runs its agent with ``stream=True`` and forwards every incremental
+update via ``ctx.yield_output(update)``. The Foundry Playground opens a
+*streaming* connection, so emitting updates as the model generates keeps that
+connection alive from the very first token of the Researcher onward. The
+earlier version called the blocking ``agent.run(...)`` and only emitted once, at
+the end, so the Playground received no bytes for the whole run and timed out
+with a "network error".
 
-The result is wrapped with ``from_agent_framework(...)`` so the Foundry Hosted
-Agent runtime can serve it (the agent server listens on port 8088).
+It is wrapped with ``from_agent_framework(...)`` so the Foundry Hosted Agent
+runtime can serve it (the agent server listens on port 8088).
 
 Prerequisites (set via a local .env file, NOT committed):
 - AZURE_AI_PROJECT_ENDPOINT       -> your Foundry project endpoint
@@ -55,6 +76,78 @@ def create_client_for_agent(
         project_client=project_client,
         deployment_name=model_deployment,
     )
+
+
+class ResearcherExecutor(Executor):
+    """First step: process the initial message and forward the conversation."""
+
+    agent: Agent
+
+    def __init__(self, agent: Agent, id: str = "Researcher"):
+        self.agent = agent
+        super().__init__(id=id)
+
+    @handler
+    async def handle(
+        self,
+        message: Message | list[Message],
+        ctx: WorkflowContext[list[Message], AgentResponseUpdate],
+    ) -> None:
+        messages = message if isinstance(message, list) else [message]
+
+        # Stream the agent's output so the Playground connection stays alive.
+        updates: list[AgentResponseUpdate] = []
+        async for update in self.agent.run(messages, stream=True):
+            updates.append(update)
+            await ctx.yield_output(update)
+
+        response = AgentResponse.from_updates(updates)
+        messages.extend(response.messages)
+        await ctx.send_message(messages)
+
+
+class WriterExecutor(Executor):
+    """Second step: receive research output and generate content."""
+
+    agent: Agent
+
+    def __init__(self, agent: Agent, id: str = "Writer"):
+        self.agent = agent
+        super().__init__(id=id)
+
+    @handler
+    async def handle(
+        self,
+        messages: list[Message],
+        ctx: WorkflowContext[list[Message], AgentResponseUpdate],
+    ) -> None:
+        updates: list[AgentResponseUpdate] = []
+        async for update in self.agent.run(messages, stream=True):
+            updates.append(update)
+            await ctx.yield_output(update)
+
+        response = AgentResponse.from_updates(updates)
+        messages.extend(response.messages)
+        await ctx.send_message(messages)
+
+
+class ReviewerExecutor(Executor):
+    """Final step: review the content and stream the final output."""
+
+    agent: Agent
+
+    def __init__(self, agent: Agent, id: str = "Reviewer"):
+        self.agent = agent
+        super().__init__(id=id)
+
+    @handler
+    async def handle(
+        self,
+        messages: list[Message],
+        ctx: WorkflowContext[Never, AgentResponseUpdate],
+    ) -> None:
+        async for update in self.agent.run(messages, stream=True):
+            await ctx.yield_output(update)
 
 
 async def main() -> None:
@@ -80,29 +173,36 @@ async def main() -> None:
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"Observability not configured, continuing without tracing: {exc}")
 
-            print("Creating agents...")
+            print("Loading agents from deployment...")
+            researcher_client = create_client_for_agent(project_client)
+            writer_client = create_client_for_agent(project_client)
+            reviewer_client = create_client_for_agent(project_client)
+            print("All agents loaded successfully\n")
 
+            # These Agent objects are LOCAL. They are not created in Foundry.
+            # `instructions` only sets each local step's prompt; it does not
+            # register or change anything in your Foundry project.
             researcher = Agent(
                 name="Researcher",
                 description="Collects relevant information",
                 instructions=(
                     "You are a researcher. Given the user's topic, produce a "
                     "concise, well-organized set of the most important facts, "
-                    "angles and talking points. Use short bullet points and "
-                    "keep it under ~200 words. Do not write the final article."
+                    "angles and talking points as short bullet points "
+                    "(under ~200 words). Do not write the final article."
                 ),
-                client=create_client_for_agent(project_client),
+                client=researcher_client,
             )
 
             writer = Agent(
                 name="Writer",
                 description="Creates well-structured content based on research",
                 instructions=(
-                    "You are a writer. Using the research notes provided in the "
-                    "conversation, write a clear, engaging draft (a few short "
-                    "paragraphs). Keep it focused and under ~300 words."
+                    "You are a writer. Using the research notes already in the "
+                    "conversation, write a clear, engaging draft of a few short "
+                    "paragraphs (under ~300 words)."
                 ),
-                client=create_client_for_agent(project_client),
+                client=writer_client,
             )
 
             reviewer = Agent(
@@ -113,25 +213,23 @@ async def main() -> None:
                     "clarity, flow and correctness, fix any issues, and return the "
                     "final polished version. Output only the final text."
                 ),
-                client=create_client_for_agent(project_client),
+                client=reviewer_client,
             )
 
-            # Wire the agents directly as executors. WorkflowBuilder auto-wraps
-            # each one in a streaming AgentExecutor, so updates are emitted
-            # incrementally as the workflow runs (keeping SSE alive).
+            researcher_executor = ResearcherExecutor(researcher)
+            writer_executor = WriterExecutor(writer)
+            reviewer_executor = ReviewerExecutor(reviewer)
+
             workflow = (
                 WorkflowBuilder(
                     name="SequentialResearchWorkflow",
                     description="Research -> Write -> Review sequential workflow",
-                    start_executor=researcher,
-                    output_executors=[reviewer],
+                    start_executor=researcher_executor,
                 )
-                .add_edge(researcher, writer)
-                .add_edge(writer, reviewer)
+                .add_edge(researcher_executor, writer_executor)
+                .add_edge(writer_executor, reviewer_executor)
                 .build()
             )
-
-            print("Workflow built. Starting agent server on :8088...")
 
             # Turn the workflow into an agent and serve it (listens on :8088).
             agentwf = workflow.as_agent()
