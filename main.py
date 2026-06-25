@@ -2,16 +2,8 @@
 
 import asyncio
 import os
-from typing import Never
 
-from agent_framework import (
-    Agent,
-    Message,
-    Executor,
-    WorkflowBuilder,
-    WorkflowContext,
-    handler,
-)
+from agent_framework import Agent, WorkflowBuilder
 from agent_framework.azure import AzureOpenAIResponsesClient
 from azure.ai.projects.aio import AIProjectClient
 from azure.identity.aio import DefaultAzureCredential
@@ -25,13 +17,24 @@ Sample: Sequential workflow hosted on Microsoft Foundry as a Hosted Agent.
 
 Sequential Workflow: Researcher -> Writer -> Reviewer
 
-This workflow orchestrates three steps in sequence:
-1. Researcher: processes the initial user message.
-2. Writer: takes the researcher's output and generates content.
-3. Reviewer: reviews and finalizes the content.
+This workflow orchestrates three agents in sequence:
+1. Researcher: gathers the key facts and angles for the user's topic.
+2. Writer: turns the research into a well-structured draft.
+3. Reviewer: polishes the draft and returns the final piece.
 
-It is wrapped with `from_agent_framework(...)` so the Foundry Hosted Agent
-runtime can serve it (the agent server listens on port 8088).
+The agents are wired *directly* into the WorkflowBuilder. The framework
+auto-wraps each agent in a streaming ``AgentExecutor`` that emits incremental
+``AgentRunUpdateEvent`` updates while the model is still generating. Those
+updates are forwarded by ``from_agent_framework(...)`` as Server-Sent-Event
+deltas, which keeps the Foundry Playground connection alive during long runs.
+
+(The earlier version used custom ``Executor`` subclasses that called the
+blocking ``agent.run(...)`` and only yielded once at the very end. That
+produced no streamed bytes until the whole workflow finished, so the
+Playground's streaming client timed out with a "network error".)
+
+The result is wrapped with ``from_agent_framework(...)`` so the Foundry Hosted
+Agent runtime can serve it (the agent server listens on port 8088).
 
 Prerequisites (set via a local .env file, NOT committed):
 - AZURE_AI_PROJECT_ENDPOINT       -> your Foundry project endpoint
@@ -39,7 +42,7 @@ Prerequisites (set via a local .env file, NOT committed):
 """
 
 
-async def create_client_for_agent(
+def create_client_for_agent(
     project_client: AIProjectClient,
 ) -> AzureOpenAIResponsesClient:
     """Create an AzureOpenAIResponsesClient backed by the Foundry project."""
@@ -52,71 +55,6 @@ async def create_client_for_agent(
         project_client=project_client,
         deployment_name=model_deployment,
     )
-
-
-class ResearcherExecutor(Executor):
-    """First step: process the initial message and forward the conversation."""
-
-    agent: Agent
-
-    def __init__(self, agent: Agent, id: str = "Researcher"):
-        self.agent = agent
-        super().__init__(id=id)
-
-    @handler
-    async def handle(self, message: Message | list[Message], ctx: WorkflowContext[list[Message]]) -> None:
-        messages = message if isinstance(message, list) else [message]
-
-        response = await self.agent.run(messages)
-
-        print("\n[Researcher] output:")
-        text = response.messages[-1].text if response.messages else ""
-        print(f"{text[:500]}..." if len(text) > 500 else text)
-
-        messages.extend(response.messages)
-        await ctx.send_message(messages)
-
-
-class WriterExecutor(Executor):
-    """Second step: receive research output and generate content."""
-
-    agent: Agent
-
-    def __init__(self, agent: Agent, id: str = "Writer"):
-        self.agent = agent
-        super().__init__(id=id)
-
-    @handler
-    async def handle(self, messages: list[Message], ctx: WorkflowContext[list[Message]]) -> None:
-        response = await self.agent.run(messages)
-
-        print("\n[Writer] output:")
-        text = response.messages[-1].text if response.messages else ""
-        print(f"{text[:500]}..." if len(text) > 500 else text)
-
-        messages.extend(response.messages)
-        await ctx.send_message(messages)
-
-
-class ReviewerExecutor(Executor):
-    """Final step: review the content and yield the workflow output."""
-
-    agent: Agent
-
-    def __init__(self, agent: Agent, id: str = "Reviewer"):
-        self.agent = agent
-        super().__init__(id=id)
-
-    @handler
-    async def handle(self, messages: list[Message], ctx: WorkflowContext[Never, list[Message]]) -> None:
-        response = await self.agent.run(messages)
-
-        print("\n[Reviewer] output:")
-        text = response.messages[-1].text if response.messages else ""
-        print(f"{text[:500]}..." if len(text) > 500 else text)
-
-        messages.extend(response.messages)
-        await ctx.yield_output(messages)
 
 
 async def main() -> None:
@@ -142,44 +80,58 @@ async def main() -> None:
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"Observability not configured, continuing without tracing: {exc}")
 
-            print("Loading agents from deployment...")
-            researcher_client = await create_client_for_agent(project_client)
-            writer_client = await create_client_for_agent(project_client)
-            reviewer_client = await create_client_for_agent(project_client)
-            print("All agents loaded successfully\n")
+            print("Creating agents...")
 
             researcher = Agent(
                 name="Researcher",
                 description="Collects relevant information",
-                client=researcher_client,
+                instructions=(
+                    "You are a researcher. Given the user's topic, produce a "
+                    "concise, well-organized set of the most important facts, "
+                    "angles and talking points. Use short bullet points and "
+                    "keep it under ~200 words. Do not write the final article."
+                ),
+                client=create_client_for_agent(project_client),
             )
 
             writer = Agent(
                 name="Writer",
                 description="Creates well-structured content based on research",
-                client=writer_client,
+                instructions=(
+                    "You are a writer. Using the research notes provided in the "
+                    "conversation, write a clear, engaging draft (a few short "
+                    "paragraphs). Keep it focused and under ~300 words."
+                ),
+                client=create_client_for_agent(project_client),
             )
 
             reviewer = Agent(
                 name="Reviewer",
-                description="Evaluates content quality and provides feedback",
-                client=reviewer_client,
+                description="Evaluates content quality and returns the final piece",
+                instructions=(
+                    "You are an editor. Review the draft in the conversation for "
+                    "clarity, flow and correctness, fix any issues, and return the "
+                    "final polished version. Output only the final text."
+                ),
+                client=create_client_for_agent(project_client),
             )
 
-            researcher_executor = ResearcherExecutor(researcher)
-            writer_executor = WriterExecutor(writer)
-            reviewer_executor = ReviewerExecutor(reviewer)
-
+            # Wire the agents directly as executors. WorkflowBuilder auto-wraps
+            # each one in a streaming AgentExecutor, so updates are emitted
+            # incrementally as the workflow runs (keeping SSE alive).
             workflow = (
                 WorkflowBuilder(
                     name="SequentialResearchWorkflow",
                     description="Research -> Write -> Review sequential workflow",
-                    start_executor=researcher_executor,
+                    start_executor=researcher,
+                    output_executors=[reviewer],
                 )
-                .add_edge(researcher_executor, writer_executor)
-                .add_edge(writer_executor, reviewer_executor)
+                .add_edge(researcher, writer)
+                .add_edge(writer, reviewer)
                 .build()
             )
+
+            print("Workflow built. Starting agent server on :8088...")
 
             # Turn the workflow into an agent and serve it (listens on :8088).
             agentwf = workflow.as_agent()

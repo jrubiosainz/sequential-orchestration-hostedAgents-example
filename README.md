@@ -14,7 +14,10 @@ See [What was fixed](#what-was-fixed) for the details.
 
 1. Sign in with the **Azure** extension in VS Code.
 2. Set a **default project** in the Foundry extension.
-3. You have a **model deployment** in that Foundry project (any chat model).
+3. You have a **model deployment** in that Foundry project. Use a **fast,
+   non-reasoning chat model** (e.g. `gpt-4.1-mini`, `gpt-4o-mini`, `gpt-4o`).
+   See the note under [Configure](#configure) about why a slow *reasoning*
+   model (e.g. `gpt-5`) makes the Playground time out.
 
 > Agent definitions are **not** required for this example — the workflow drives
 > the model deployment directly. The executor steps (`Researcher`, `Writer`,
@@ -28,8 +31,16 @@ into the image — you provide it locally). Copy `.env.example`:
 
 ```env
 AZURE_AI_PROJECT_ENDPOINT=<your-foundry-project-endpoint>
-AZURE_AI_MODEL_DEPLOYMENT_NAME=<your-model-deployment-name>
+AZURE_AI_MODEL_DEPLOYMENT_NAME=gpt-4.1-mini
 ```
+
+> **Use a fast (non-reasoning) model.** The workflow runs three agents in
+> sequence and the Foundry **Playground streams** the answer over a live
+> connection. A *reasoning* model such as `gpt-5` can spend ~45s per call
+> "thinking" before emitting any tokens; across three sequential agents that
+> silence makes the Playground connection drop with a **"network error" /
+> "Session not started"**. A fast model (`gpt-4.1-mini`, `gpt-4o-mini`,
+> `gpt-4o`) keeps the whole run to a few seconds and streams smoothly.
 
 > **How these reach the running container.** The hosted runtime does **not**
 > read your `.env` file. `agent.yaml` declares an `environment_variables:` block
@@ -73,7 +84,7 @@ Root cause and fixes:
 
 | Problem | Fix |
 | --- | --- |
-| **The container started with no configuration and crashed at startup** (`ValueError: AZURE_AI_PROJECT_ENDPOINT environment variable is required`), so readiness never returned 200 and the agent showed `session_not_ready`. The deploy log said *"No environment variables found in agent.yaml"*. The hosted runtime does **not** read the local `.env` — env vars must be declared in `agent.yaml`. | Added an `environment_variables:` block to `agent.yaml` that injects `AZURE_AI_PROJECT_ENDPOINT` and `AZURE_AI_MODEL_DEPLOYMENT_NAME` into the container (resolved from your `.env` at deploy time). |
+| **The Playground showed "network error" / "Session not started"** even though the agent deployed and ran. The workflow was built from custom `Executor` subclasses that called the **blocking** `agent.run(...)` and only `yield`ed once, at the very end. The Playground opens a **streaming** connection, so it received **no bytes** for the whole run and the connection timed out. (App Insights confirmed a ~137s run with all updates dumped at the end.) | The three agents are now wired **directly** into `WorkflowBuilder` (`start_executor=researcher … add_edge … output_executors=[reviewer]`). The framework auto-wraps each agent in a streaming `AgentExecutor` that emits incremental updates while the model generates, which `from_agent_framework(...)` forwards as SSE deltas — keeping the connection alive. This matches the official multi-agent hosted-agent sample. Pair it with a **fast model** (see [Configure](#configure)). | (`ValueError: AZURE_AI_PROJECT_ENDPOINT environment variable is required`), so readiness never returned 200 and the agent showed `session_not_ready`. The deploy log said *"No environment variables found in agent.yaml"*. The hosted runtime does **not** read the local `.env` — env vars must be declared in `agent.yaml`. | Added an `environment_variables:` block to `agent.yaml` that injects `AZURE_AI_PROJECT_ENDPOINT` and `AZURE_AI_MODEL_DEPLOYMENT_NAME` into the container (resolved from your `.env` at deploy time). |
 | `requirements.txt` pinned the umbrella **`agent-framework==1.0.0rc3`**, which resolves to `agent-framework-core[all]` and installs **every** optional integration (a2a, copilotstudio, devui, redis, mem0, anthropic, ollama, …). The huge install made the ACR build run for minutes and time out. | Depend only on `agent-framework-core`, `agent-framework-azure-ai`, the agent-server adapter, and the observability package — all pinned so pip resolves with no backtracking. |
 | The whole repo (`.git`, `images/`, `.devcontainer/`, `.foundry/`, …) was uploaded and `COPY`-ed into the image, bloating the build context. | Added a `.dockerignore` so only the app is uploaded/copied. |
 | `main` returned **before starting the server** when Application Insights was not connected, so the container exited and the agent never appeared in Foundry. | Observability is now **best-effort**; the agent server always starts. |
