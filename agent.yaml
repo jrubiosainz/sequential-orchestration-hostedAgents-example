@@ -27,6 +27,8 @@ environment_variables:
     value: ${AZURE_AI_PROJECT_ENDPOINT}
   - name: AZURE_AI_MODEL_DEPLOYMENT_NAME
     value: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}
+  - name: BING_GROUNDING_CONNECTION_ID
+    value: ${BING_GROUNDING_CONNECTION_ID}
 
 dockerfile_path: Dockerfile
 
